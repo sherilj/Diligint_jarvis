@@ -32,17 +32,18 @@ if not PINECONE_API_KEY:
 if "local_vectorstore" not in st.session_state:
     st.session_state["local_vectorstore"] = None
     st.session_state["local_doc_count"] = 0
-
-# Initialize Pinecone (FIXED: Use env var, not hardcoded)
+# Initialize Pinecone client and embedding stack
 pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(INDEX_NAME)  # FIXED: Use INDEX_NAME, not 'jarvis'
+index = pc.Index(INDEX_NAME)
 
-# Initialize embeddings & LLM
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+
 embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
 llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, temperature=0, model="gpt-4o-mini")
+
+
 class PineconeRetriever(BaseRetriever):
-    """Lightweight retriever for the new Pinecone SDK + LangChain."""
+    """Bridges the Pinecone SDK and LangChain retriever interface."""
 
     index: Any
     embeddings: OpenAIEmbeddings
@@ -113,19 +114,19 @@ def build_local_vectorstore(files: List[Any]):
     return vectorstore, len(chunks)
 
 
+connection_message = None
+total_vectors = 0
 try:
     stats = index.describe_index_stats()
     total_vectors = stats.get("total_vector_count", 0) if isinstance(stats, dict) else getattr(stats, "total_vector_count", 0)
-    st.success(f"✅ Connected to index '{INDEX_NAME}' with {total_vectors} vectors.")
+    connection_message = f"Connected to index '{INDEX_NAME}' with {total_vectors} vectors."
 except Exception as e:
     st.error(f"❌ Pinecone index check failed: {e}. Run ingestion script first? (Check index name matches.)")
     st.stop()
 
 retriever = PineconeRetriever(index=index, embeddings=embeddings, top_k=3)
-
-# LangChain version check & chain setup
 import langchain
-st.caption(f"LangChain version: {langchain.__version__}")
+langchain_version = langchain.__version__
 
 st.sidebar.title("Workspace")
 st.sidebar.caption("Upload documents to chat about them instantly.")
@@ -163,9 +164,11 @@ if st.session_state.get("local_vectorstore"):
     active_retriever = st.session_state["local_vectorstore"].as_retriever(search_kwargs={"k": 3})
     data_source_label = f"Uploaded docs ({st.session_state.get('local_doc_count', 0)} chunks)"
 
-st.caption(f"📦 Answer source: {data_source_label}")
-
+diagnostics: List[str] = []
+chain_error: str | None = None
+qa = None
 chain_type = None
+
 try:
     from langchain.chains.retrieval_qa.base import RetrievalQA
 
@@ -176,9 +179,9 @@ try:
         return_source_documents=True,
     )
     chain_type = "Legacy RetrievalQA"
-    st.caption("✅ Using Legacy RetrievalQA")
+    diagnostics.append("Using Legacy RetrievalQA pipeline")
 except ImportError as legacy_error:
-    st.warning(f"Legacy import failed ({legacy_error}). Falling back to modern chain.")
+    diagnostics.append(f"Legacy RetrievalQA unavailable: {legacy_error}")
     try:
         from langchain.chains import create_retrieval_chain
         from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -190,42 +193,155 @@ except ImportError as legacy_error:
         document_chain = create_stuff_documents_chain(llm, prompt)
         qa = create_retrieval_chain(active_retriever, document_chain)
         chain_type = "Modern LCEL Chain"
-        st.caption("✅ Using Modern LCEL Chain")
+        diagnostics.append("Using Modern LCEL retrieval chain")
     except ImportError as modern_error:
-        st.error(f"❌ Modern imports also failed: {modern_error}. Reinstall LangChain per guide.")
-        st.stop()
+        chain_error = (
+            "LangChain optional modules missing. Install `langchain` with retrieval extras "
+            "to enable question answering."
+        )
+        diagnostics.append(f"Modern chain unavailable: {modern_error}")
+    except Exception as modern_generic_error:
+        chain_error = f"Retrieval chain initialization failed: {modern_generic_error}"
+else:
+    chain_error = None
+
+if qa is None and chain_error is None:
+    chain_error = "Retrieval chain did not initialize. Check diagnostics for details."
 
 # Streamlit UI
 st.title("🤖 Jarvis AI Assistant")
 st.markdown("Ask about your uploaded docs—powered by Pinecone + OpenAI!")
+st.markdown(
+    """
+    <style>
+    .jarvis-hero {
+        background: radial-gradient(circle at 20% 20%, #20304f, #0d1117);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 20px;
+        padding: 32px;
+        color: #f5f7ff;
+        margin-bottom: 1.5rem;
+        box-shadow: 0 20px 45px rgba(15, 27, 51, 0.55);
+    }
+    .jarvis-hero h2 {
+        margin-bottom: 0.1rem;
+    }
+    .jarvis-pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 12px;
+    }
+    .jarvis-pill {
+        border-radius: 999px;
+        padding: 6px 16px;
+        background: rgba(255, 255, 255, 0.1);
+        font-size: 0.85rem;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+    }
+    .jarvis-steps {
+        margin-top: 1.5rem;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 1rem;
+    }
+    .jarvis-step {
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .jarvis-step span {
+        font-size: 0.75rem;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        opacity: 0.8;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
+session_chunks = st.session_state.get("local_doc_count", 0)
 query = st.text_input("Ask me anything:", placeholder="e.g., What does the doc say about AI ethics?")
 
+if not query:
+    st.markdown(
+        f"""
+        <div class="jarvis-hero">
+            <h2>👋 Welcome to Jarvis</h2>
+            <p>Your always-on AI analyst for PDFs, research decks, and knowledge bases.</p>
+            <div class="jarvis-pills">
+                <div class="jarvis-pill">Pinecone index: {INDEX_NAME}</div>
+                <div class="jarvis-pill">LangChain {langchain_version}</div>
+                <div class="jarvis-pill">OpenAI GPT-4o-mini</div>
+            </div>
+            <div class="jarvis-steps">
+                <div class="jarvis-step">
+                    <span>Step 1</span>
+                    <h4>Upload files</h4>
+                    <p>Drop PDF/TXT documents into the sidebar uploader.</p>
+                </div>
+                <div class="jarvis-step">
+                    <span>Step 2</span>
+                    <h4>Build local index</h4>
+                    <p>Create a temporary vector store just for this session.</p>
+                </div>
+                <div class="jarvis-step">
+                    <span>Step 3</span>
+                    <h4>Ask anything</h4>
+                    <p>Jarvis cites the exact snippets used in every answer.</p>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Pinecone Vectors", f"{total_vectors:,}")
+    col2.metric("Active Source", data_source_label)
+    col3.metric("Session Chunks", session_chunks)
+    st.info("Tip: Use the sidebar to toggle between persistent data and fresh uploads.")
+
 if query:
-    with st.spinner("Jarvis is thinking..."):
-        try:
-            # Invoke (works for both chain types)
-            if chain_type == "Legacy RetrievalQA":
-                result = qa.invoke({"query": query})
-                response = result["result"]
-                sources = result.get("source_documents", [])
-            else:  # Modern
-                result = qa.invoke({"input": query})
-                response = result["answer"]
-                sources = result.get("context", [])
-            
-            st.subheader("**Jarvis:**")
-            st.write(response)
-            
-            if sources:
-                with st.expander("📚 Sources (for transparency)"):
-                    for i, doc in enumerate(sources):
-                        source_name = doc.metadata.get('source', 'Unknown') if hasattr(doc, 'metadata') else 'N/A'
-                        st.write(f"**Source {i+1}:** {source_name}")
-                        snippet = doc.page_content[:200] + "..." if hasattr(doc, 'page_content') else str(doc)[:200] + "..."
-                        st.write(f"**Snippet:** {snippet}")
-        except Exception as e:
-            st.error(f"⚠️ Query failed: {e}. Check console for details (e.g., empty index?).")
+    if qa is None:
+        st.warning("Jarvis cannot answer questions until LangChain retrieval components are installed. See Diagnostics for fix steps.")
+    else:
+        with st.spinner("Jarvis is thinking..."):
+            try:
+                # Invoke (works for both chain types)
+                if chain_type == "Legacy RetrievalQA":
+                    result = qa.invoke({"query": query})
+                    response = result["result"]
+                    sources = result.get("source_documents", [])
+                else:  # Modern
+                    result = qa.invoke({"input": query})
+                    response = result["answer"]
+                    sources = result.get("context", [])
+                
+                st.subheader("**Jarvis:**")
+                st.write(response)
+                
+                if sources:
+                    with st.expander("📚 Sources (for transparency)"):
+                        for i, doc in enumerate(sources):
+                            source_name = doc.metadata.get('source', 'Unknown') if hasattr(doc, 'metadata') else 'N/A'
+                            st.write(f"**Source {i+1}:** {source_name}")
+                            snippet = doc.page_content[:200] + "..." if hasattr(doc, 'page_content') else str(doc)[:200] + "..."
+                            st.write(f"**Snippet:** {snippet}")
+            except Exception as e:
+                st.error(f"⚠️ Query failed: {e}. Check console for details (e.g., empty index?).")
+
+with st.expander("Diagnostics", expanded=False):
+    if connection_message:
+        st.success(f"✅ {connection_message}")
+    st.caption(f"LangChain version: {langchain_version}")
+    st.caption(f"📦 Answer source: {data_source_label}")
+    if diagnostics:
+        for note in diagnostics:
+            st.write(f"• {note}")
+    if chain_error:
+        st.error(chain_error)
 
 # Footer
 st.markdown("---")
